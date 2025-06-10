@@ -1,0 +1,8 @@
+[package]
+name = "rustysnake"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ipc-channel = "0.18"
+serde = { version = "1.0", features = ["derive"] }
