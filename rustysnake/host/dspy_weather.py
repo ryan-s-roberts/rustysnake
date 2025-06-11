@@ -2,18 +2,22 @@ import time
 import random
 import dspy
 from time import sleep
-
-def lookup_population(city: str):
-    # Placeholder, will be replaced by Rust thunk from Rust host
-    return 0
+import sys
 
 def search_wikipedia(query: str):
     results = dspy.ColBERTv2(url='http://20.102.90.50:2017/wiki17_abstracts')(query, k=3)
     return [x['text'] for x in results]
 
+def lookup_population(city: str):
+    # Always fetch the latest function from the module (including Rust thunk)
+    return getattr(sys.modules[__name__], "lookup_population")(city)
+
+def _lookup_population_placeholder(city: str):
+    # Placeholder, will be replaced by Rust thunk from Rust host
+    pass
 # Register tools for DSPy
 TOOLS = [
-    lookup_population,   # Will be replaced by Rust thunk
+    lookup_population,   # This function's __name__ is 'lookup_population'
     search_wikipedia,
 ]
 

@@ -21,10 +21,6 @@ use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 use tracing_subscriber::fmt::format::FmtSpan;
 
-#[derive(Serialize, Deserialize, Debug)]
-struct WeatherRequest {
-    city: String,
-}
 
 #[derive(Serialize, Deserialize, Debug)]
 struct ThunkRequest {
@@ -49,6 +45,8 @@ struct PythonRequest {
     response_tx: oneshot::Sender<Result<String, String>>,
 }
 
+static LOOKUP_POPULATION_CALLS: AtomicUsize = AtomicUsize::new(0);
+
 fn start_python_worker(worker_id: usize, mut rx: mpsc::UnboundedReceiver<PythonRequest>, shutdown: Arc<AtomicBool>) {
     std::thread::spawn(move || {
         pyo3::prepare_freethreaded_python();
@@ -59,6 +57,7 @@ fn start_python_worker(worker_id: usize, mut rx: mpsc::UnboundedReceiver<PythonR
             // Inject DummyLM definition into every worker
             let dspy_lm_config = CString::new(r#"
 import dspy
+import random
 
 class DummyLM(dspy.LM):
     def __init__(self, **kwargs):
@@ -66,11 +65,16 @@ class DummyLM(dspy.LM):
         self.model = "dummy"
     def __call__(self, prompt=None, messages=None, signature=None, **kwargs):
         import json
+        tool = random.choice(["lookup_population", "search_wikipedia"])
+        if tool == "lookup_population":
+            args = {"city": "Paris"}
+        else:
+            args = {"query": "Eiffel Tower"}
         result = json.dumps({
             "reasoning": "dummy reasoning",
             "next_thought": "dummy next_thought",
-            "next_tool_name": "finish",
-            "next_tool_args": {},
+            "next_tool_name": tool,
+            "next_tool_args": args,
         })
         return [result]
 dspy.settings.configure(lm=DummyLM(), adapter=dspy.JSONAdapter())
@@ -78,11 +82,8 @@ dspy.settings.configure(lm=DummyLM(), adapter=dspy.JSONAdapter())
             py.run(dspy_lm_config.expect("CString failed").as_c_str(), Some(&locals), Some(&locals)).unwrap();
             let importlib = py.import("importlib").unwrap();
             let dspy_weather = py.import("dspy_weather").unwrap();
-            // Ensure lookup_population is available in dspy_weather module
             let lookup_population_py = pyo3::wrap_pyfunction!(lookup_population, py).unwrap();
-            dspy_weather.setattr("lookup_population", lookup_population_py).unwrap();
-            importlib.call_method1("reload", (dspy_weather,)).unwrap();
-            let dspy_weather = py.import("dspy_weather").unwrap();
+            dspy_weather.setattr("lookup_population", &lookup_population_py).unwrap();
             let react = dspy_weather.getattr("react").unwrap();
             loop {
                 if shutdown.load(Ordering::SeqCst) {
@@ -118,7 +119,7 @@ dspy.settings.configure(lm=DummyLM(), adapter=dspy.JSONAdapter())
                             tracing::debug!(worker_id = worker_id, result_type = %type_name, result_str = %value_str, "Python result type and value");
                         }
                         Err(e) => {
-                            tracing::error!(worker_id = worker_id, error = %e, "Python error before extraction");
+                            tracing::debug!(worker_id = worker_id, error = %e, "Python error before extraction");
                         }
                     }
                     match py_result {
@@ -169,7 +170,7 @@ dspy.settings.configure(lm=DummyLM(), adapter=dspy.JSONAdapter())
                         },
                     }
                 })();
-                tracing::debug!(worker_id = worker_id, city = %req.question, ?result, "Sending response for city");
+                tracing::debug!(worker_id = worker_id, city = %req.question, ?result, "Sending request for city");
                 if let Ok(ref answer) = result {
                     tracing::debug!(worker_id = worker_id, answer = %answer, "Extracted answer string");
                 }
@@ -177,19 +178,15 @@ dspy.settings.configure(lm=DummyLM(), adapter=dspy.JSONAdapter())
                     tracing::error!(worker_id = worker_id, ?e, "ERROR sending response");
                 }
             }
-            tracing::debug!(worker_id = worker_id, "Exiting worker loop");
+            tracing::info!(worker_id = worker_id, "Exiting worker loop");
         });
     });
 }
 
-#[pyfunction]
-fn lookup_weather(city: String) -> PyResult<String> {
-    debug!("lookup_weather thunk called for city: {}, thread: {:?}", city, thread::current().id());
-    Ok(format!("The weather in {} is always sunny!", city))
-}
 
 #[pyo3::pyfunction]
 fn lookup_population(city: String) -> i32 {
+    LOOKUP_POPULATION_CALLS.fetch_add(1, Ordering::Relaxed);
     tracing::info!("lookup_population thunk 🐍 -> 🦀 called for city: {}", city);
     // Example: return a fake population
     match city.as_str() {
@@ -200,52 +197,9 @@ fn lookup_population(city: String) -> i32 {
     }
 }
 
-fn run_python(question: String) -> String {
-    let thread_id = std::thread::current().id();
-    let start = std::time::Instant::now();
-    tracing::debug!("START question = {}, task thread = {:?}", question, thread_id);
-    let exe_path = std::env::current_exe().expect("Failed to get current exe path");
-    let repo_root = exe_path
-        .parent().and_then(|p| p.parent()).and_then(|p| p.parent())
-        .expect("Failed to find repo root");
-    let script_path = repo_root.join("rustysnake/host/dspy_weather.py");
-    let script = std::fs::read_to_string(&script_path)
-        .unwrap_or_else(|_| panic!("Failed to read {:?}", script_path));
-    let script_cstr = std::ffi::CString::new(script).unwrap();
-    let answer = Python::with_gil(|py| {
-        let lookup_population_py = pyo3::wrap_pyfunction!(lookup_population, py).unwrap();
-        let locals = pyo3::types::PyDict::new(py);
-        locals.set_item("lookup_population", lookup_population_py).unwrap();
-        py.run(script_cstr.as_c_str(), Some(&locals), Some(&locals)).unwrap();
-        let react = locals.get_item("react").expect("react missing");
-        let kwargs = pyo3::types::PyDict::new(py);
-        kwargs.set_item("question", question.clone()).unwrap();
-        let result = react.expect("react missing").call((), Some(&kwargs)).unwrap();
-        // Try to extract 'answer' attribute if result is a Prediction object
-        if let Ok(answer_attr) = result.getattr("answer") {
-            if let Ok(answer) = answer_attr.extract::<String>() {
-                answer
-            } else {
-                format!("{:?}", answer_attr)
-            }
-        } else if let Ok(dict) = result.downcast::<pyo3::types::PyDict>() {
-            if let Ok(Some(answer_obj)) = dict.get_item("answer") {
-                answer_obj.extract::<String>().unwrap_or_else(|_| format!("{:?}", answer_obj))
-            } else {
-                format!("{:?}", dict)
-            }
-        } else {
-            result.str().unwrap().to_str().unwrap().to_string()
-        }
-    });
-    let duration = start.elapsed();
-    tracing::debug!("END question = {}, duration = {:?}, task thread = {:?}", question, duration, thread_id);
-    tracing::info!("🦀 -> 🐍 -> 🦀 question = {}, answer = {}", question, answer);
-    answer
-}
-
 #[tokio::main]
 async fn main() {
+    println!("Starting host");
     // Set up tracing to always log at INFO level or lower, output to stdout
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
@@ -259,36 +213,11 @@ async fn main() {
         .expect("Failed to find repo root");
     let venv_path = repo_root.join("rustysnake/host/pyenv");
     let site_packages = venv_path.join("lib/python3.13/site-packages");
-    let venv_bin = venv_path.join("bin");
-    let pythonpath = std::env::var_os("PYTHONPATH");
-    let need_reexec = match &pythonpath {
-        Some(val) => !val.to_string_lossy().contains(site_packages.to_string_lossy().as_ref()),
-        None => true,
-    };
-    if need_reexec {
-        let mut cmd = std::process::Command::new(&exe_path);
-        cmd.args(std::env::args().skip(1));
-        // Set PYTHONPATH
-        cmd.env("PYTHONPATH", &site_packages);
-        // Prepend venv/bin to PATH
-        let old_path = std::env::var_os("PATH").unwrap_or_default();
-        let new_path = std::env::join_paths(
-            std::iter::once(venv_bin.into_os_string())
-                .chain(std::env::split_paths(&old_path).map(|p| p.into_os_string()))
-        ).unwrap();
-        cmd.env("PATH", &new_path);
-        // Preserve DYLD_LIBRARY_PATH if set
-        if let Some(dyld) = std::env::var_os("DYLD_LIBRARY_PATH") {
-            cmd.env("DYLD_LIBRARY_PATH", dyld);
-        }
-        // Inherit all other env vars
-        cmd.envs(std::env::vars_os());
-        let err = cmd.status().expect("Failed to re-exec self");
-        std::process::exit(err.code().unwrap_or(1));
-    }
+    println!("[DEBUG] site_packages={}", site_packages.display());
+    
     pyo3::prepare_freethreaded_python();
-    debug!("Embedding Python with PyO3 and in-process thunks");
-    let num_workers = 10;
+    tracing::info!("Embedding Python with PyO3 and in-process thunks");
+    let num_workers = 1;
     let mut worker_senders: Vec<mpsc::UnboundedSender<PythonRequest>> = Vec::new();
     let shutdown = Arc::new(AtomicBool::new(false));
     {
@@ -314,7 +243,7 @@ async fn main() {
         "Venice", "Florence", "Munich", "Hamburg", "Frankfurt", "Cologne", "Stuttgart", "Dusseldorf", "Leipzig", "Dresden"
     ];
     let original_cities = cities.clone();
-    let total_requests = 10;
+    let total_requests = 10000;
     while cities.len() < total_requests {
         cities.extend_from_slice(&original_cities);
     }
@@ -353,7 +282,7 @@ async fn main() {
             }
             // Optionally: track send_duration for backpressure
             if send_duration > std::time::Duration::from_millis(10) {
-                println!("[BACKPRESSURE] Request for {} waited {:?} to send to worker {}", city, send_duration, idx);
+                tracing::warn!("[BACKPRESSURE] Request for {} waited {:?} to send to worker {}", city, send_duration, idx);
             }
         });
         handles.push(handle);
@@ -409,11 +338,5 @@ async fn main() {
         }
     }
     println!("------------------------\n");
-    Python::with_gil(|py| {
-        let sys = py.import("sys").unwrap();
-        let exe: String = sys.getattr("executable").unwrap().extract().unwrap();
-        let path: Vec<String> = sys.getattr("path").unwrap().extract().unwrap();
-        debug!("PYDBG: sys.executable = {}", exe);
-        debug!("PYDBG: sys.path = {:?}", path);
-    });
+    println!("lookup_population thunk was called {} times.", LOOKUP_POPULATION_CALLS.load(Ordering::Relaxed));
 } 
