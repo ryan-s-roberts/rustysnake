@@ -1,5 +1,5 @@
 # Add your Python dependencies here
 # Example: dspy 
-dspy 
+dspy==3.0.0b1
 # Use latest tokenizers from GitHub for PyO3 0.25.0 compatibility
 git+https://github.com/huggingface/tokenizers.git#subdirectory=bindings/python
